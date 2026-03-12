@@ -4,9 +4,3 @@ __pycache__/
 .env
 tool_schemas.json
 .claude/
-
-# Large copied dirs from toolathlon_gym (tracked separately)
-local_servers/
-tasks/
-db/
-configs/
