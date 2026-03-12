@@ -1,0 +1,9 @@
+openreward
+mcp>=1.0.0
+pydantic>=2.0
+psycopg2-binary
+python-docx
+openpyxl
+python-pptx
+pyyaml
+aiofiles
