@@ -177,6 +177,14 @@ class MCPBridge:
             env_vars = {k: _resolve(v, self.workspace_dir) for k, v in params.get("env", {}).items()}
             cwd = _resolve(params.get("cwd", self.workspace_dir), self.workspace_dir)
 
+            # For "uv run <script>" without --directory, infer cwd from script path
+            if command == "uv" and "run" in args and "cwd" not in params:
+                run_idx = args.index("run")
+                if run_idx + 1 < len(args):
+                    script_path = args[run_idx + 1]
+                    if os.path.isfile(script_path):
+                        cwd = os.path.dirname(script_path)
+
             # Override PG_HOST to localhost since DB runs in same container
             full_env = {**os.environ, **env_vars, "PG_HOST": "localhost", "PGHOST": "localhost"}
             os.makedirs(cwd, exist_ok=True)

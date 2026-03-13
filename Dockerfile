@@ -57,25 +57,27 @@ RUN for dir in \
         /opt/local_servers/Calendar-Autoauth-MCP-Server \
         /opt/local_servers/filesystem \
         /opt/local_servers/google-forms-mcp \
+        /opt/local_servers/HowToCook-mcp \
         /opt/local_servers/mcp-canvas-lms \
-        /opt/local_servers/mcp-google-sheets \
         /opt/local_servers/mcp-npx-fetch \
-        /opt/local_servers/notion-mcp-server \
         /opt/local_servers/playwright-mcp \
         /opt/local_servers/servers \
-        /opt/local_servers/woocommerce-mcp \
         /opt/local_servers/youtube-mcp-server; do \
     ( [ -f "$dir/package.json" ] && \
         echo "=== npm: $dir ===" && cd "$dir" && npm install && (npm run build 2>/dev/null || true) ) & \
 done && wait
+
+# These servers need pg for their Toolathlon PG-backed forks
+RUN cd /opt/local_servers/woocommerce-mcp && npm install pg @types/pg && npm run build
+RUN cd /opt/local_servers/notion-mcp-server && npm install pg @types/pg && npm run build
 
 # Build Python MCP servers (parallel)
 RUN for dir in \
         /opt/local_servers/arxiv-mcp-server \
         /opt/local_servers/arxiv-latex-mcp \
         /opt/local_servers/yahoo-finance-mcp \
-        /opt/local_servers/HowToCook-mcp \
         /opt/local_servers/emails-mcp \
+        /opt/local_servers/mcp-google-sheets \
         /opt/local_servers/mcp-snowflake-server \
         /opt/local_servers/mcp-scholarly \
         /opt/local_servers/Office-Word-MCP-Server \
@@ -87,6 +89,9 @@ RUN for dir in \
     ( [ -f "$dir/pyproject.toml" ] && \
         echo "=== uv: $dir ===" && cd "$dir" && uv sync 2>/dev/null || true ) & \
 done && wait
+
+# yahoo-finance Toolathlon fork uses psycopg2 for PG-backed data
+RUN cd /opt/local_servers/yahoo-finance-mcp && uv add psycopg2-binary
 
 # Setup PostgreSQL: create user/database and allow trust auth for local connections
 USER postgres

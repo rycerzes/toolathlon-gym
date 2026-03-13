@@ -83,7 +83,17 @@ def discover_server(yaml_path: Path, workspace: str) -> list[dict] | None:
     env_vars = {k: resolve(v, workspace) for k, v in params.get("env", {}).items()}
     cwd = resolve(params.get("cwd", workspace), workspace)
 
-    full_env = {**os.environ, **env_vars}
+    # For "uv run <script>" without --directory, infer cwd from the script path
+    # so uv can find the project's pyproject.toml
+    if command == "uv" and "run" in args and "cwd" not in params:
+        run_idx = args.index("run")
+        if run_idx + 1 < len(args):
+            script_path = args[run_idx + 1]
+            if os.path.isfile(script_path):
+                cwd = os.path.dirname(script_path)
+
+    # Override PG_HOST to localhost since DB runs in same container
+    full_env = {**os.environ, **env_vars, "PG_HOST": "localhost", "PGHOST": "localhost"}
     os.makedirs(cwd, exist_ok=True)
 
     name = cfg.get("name", yaml_path.stem)
