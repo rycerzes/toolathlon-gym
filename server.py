@@ -469,11 +469,11 @@ class ToolathlonGym(Environment):
 
     @classmethod
     def list_splits(cls) -> list[str]:
-        return ["test"]
+        return ["train"]
 
     @classmethod
     def list_tasks(cls, split: str) -> list[dict]:
-        if split != "test":
+        if split != "train":
             return []
         return [
             {"task_name": d.name}
