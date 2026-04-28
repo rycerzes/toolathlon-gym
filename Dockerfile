@@ -21,7 +21,7 @@ ENV PATH="/root/.local/bin:$PATH"
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g npm@latest
+    && npm install -g npm@10
 
 # Python venv with ORS + task dependencies
 RUN uv venv /opt/venv --python 3.12 && uv pip install --python /opt/venv/bin/python \
