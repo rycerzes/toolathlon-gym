@@ -25,7 +25,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 # Python venv with ORS + task dependencies
 RUN uv venv /opt/venv --python 3.12 && uv pip install --python /opt/venv/bin/python \
-    "openreward>=0.1.59" \
+    "openreward>=0.1.95" \
     "mcp>=1.0.0" \
     "pydantic>=2.0" \
     psycopg2-binary \
