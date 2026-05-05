@@ -409,26 +409,46 @@ class ToolathlonGym(Environment):
             by_server[entry["server"]].append(entry)
 
         lines: list[str] = [
-            "## Available MCP tools",
+            "## Tools",
             "",
-            f"This task exposes {len(self._task_tool_index)} MCP tools across "
-            f"{len(by_server)} servers, listed below as `server.tool_name — "
-            "short description`. Two meta-tools mediate access:",
+            "You have **two layers** of tools. Treat them differently.",
             "",
-            "- `get_tool_details(name)` — return the full `input_schema` (and "
-            "untruncated description) for one tool. Pass the exact "
-            "`server.tool_name` shown in the catalog.",
-            "- `call_tool(name, arguments)` — invoke a tool. `name` is again "
-            "the exact `server.tool_name`; `arguments` must conform to the "
-            "tool's `input_schema`.",
+            "### 1. Direct tools — call by name like any normal tool",
             "",
-            "Typical workflow: scan the catalog → `get_tool_details` for the "
-            "tool(s) you want to call → `call_tool`. The shared "
-            "`python_execute` and `claim_done` tools remain directly callable.",
+            "Your top-level tool list contains a small set of tools registered "
+            "directly by the environment, including `get_tool_details`, "
+            "`call_tool`, `python_execute`, and the task-completion tool "
+            "(check your tool list for its exact registered name, e.g. "
+            "`claim_done`). Invoke any of these the way you invoke any "
+            "function tool — by its own name, with its own arguments.",
+            "",
+            "**Do NOT pass these names to `call_tool`.** `call_tool` is "
+            "exclusively for the MCP catalog below. For example, to finish a "
+            "task call the completion tool directly with no arguments — "
+            "never `call_tool(name=\"claim_done\", ...)` or "
+            "`call_tool(name=\"functions.claim_done\", ...)`.",
+            "",
+            "The two meta-tools you'll use to reach the catalog:",
+            "",
+            "- `get_tool_details(name)` — return the full `input_schema` "
+            "(and untruncated description) for one MCP tool. `name` is the "
+            "dotted `server.tool_name` form from the catalog below.",
+            "- `call_tool(name, arguments)` — invoke one MCP tool from the "
+            "catalog below. `name` is again the dotted `server.tool_name`; "
+            "`arguments` must conform to that tool's `input_schema`.",
+            "",
+            f"### 2. MCP tool catalog — {len(self._task_tool_index)} tools "
+            f"across {len(by_server)} servers",
+            "",
+            "These tools are **not** in your top-level tool list; the only "
+            "way to invoke them is via `call_tool`. Each is shown below as "
+            "`server.tool_name — short description`. Workflow: scan the "
+            "catalog → call `get_tool_details` if you need the full "
+            "input_schema → invoke via `call_tool`.",
             "",
         ]
         for server in sorted(by_server):
-            lines.append(f"### {server}")
+            lines.append(f"#### {server}")
             for entry in sorted(by_server[server], key=lambda e: e["name"]):
                 desc = self._short_desc(entry["description"])
                 if desc:
