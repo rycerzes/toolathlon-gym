@@ -1,9 +1,19 @@
 """
 Toolathlon Gym — OpenReward Standard environment server.
 
-Exposes 503 multi-tool tasks via ORS. Each task's MCP tools are surfaced as
-first-class tools through list_task_tools(). The ORS server, PostgreSQL, and
-MCP server subprocesses all run inside the same Docker container.
+Exposes 503 multi-tool tasks via ORS. The ORS server, PostgreSQL, and MCP
+server subprocesses all run inside the same Docker container.
+
+Tool exposure
+-------------
+A task's MCP tools can run into the hundreds, which blows past the 128-tool
+ceiling on OpenAI-compatible inference endpoints. Instead of registering
+each MCP tool individually, `list_task_tools()` returns just two
+meta-tools, `get_tool_details` and `call_tool`. The full per-task catalog
+(name + one-line description for every available tool) is inlined into the
+system prompt so the agent sees the menu up front; it fetches a tool's
+input_schema on demand via `get_tool_details` and invokes it via
+`call_tool`.
 """
 import asyncio
 import json
@@ -13,7 +23,7 @@ import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from uuid import uuid4
 
 import yaml
@@ -37,6 +47,8 @@ TASKS_ROOT = Path("/app/tasks/finalpool")
 CONFIGS_DIR = Path("/app/configs/mcp_servers")
 LOCAL_SERVERS = "/opt/local_servers"
 TOOL_SCHEMAS_FILE = Path("/app/tool_schemas.json")
+
+CATALOG_DESC_MAX_CHARS = 160
 
 # ── Load pre-discovered tool schemas ─────────────────────────────────────────
 
@@ -154,11 +166,13 @@ class MCPBridge:
         self.needed_servers = needed_servers
         self.workspace_dir = workspace_dir
         self._processes: dict[str, _MCPProcess] = {}
-        # Build tool_name → server_name mapping from pre-discovered schemas
-        self._tool_to_server: dict[str, str] = {}
+        # bare tool name → list of servers offering it. Multi-valued because
+        # different MCP servers can advertise tools with the same name; callers
+        # should pass `server` to disambiguate when needed.
+        self._tool_servers: dict[str, list[str]] = defaultdict(list)
         for server in needed_servers:
             for tool_info in ALL_TOOL_SCHEMAS.get(server, []):
-                self._tool_to_server[tool_info["name"]] = server
+                self._tool_servers[tool_info["name"]].append(server)
 
     async def start(self):
         """Launch and initialize all needed MCP servers."""
@@ -209,13 +223,19 @@ class MCPBridge:
             except Exception as e:
                 print(f"[MCPBridge] WARNING: Failed to launch {name}: {e}")
 
-    async def call_tool(self, tool_name: str, arguments: dict) -> str:
-        server_name = self._tool_to_server.get(tool_name)
-        if not server_name:
+    async def call_tool(self, tool_name: str, arguments: dict, *, server: str | None = None) -> str:
+        candidates = self._tool_servers.get(tool_name) or []
+        if not candidates:
             return f"Error: Unknown tool '{tool_name}'"
-        proc = self._processes.get(server_name)
+        if server is not None:
+            if server not in candidates:
+                return f"Error: Tool '{tool_name}' is not provided by server '{server}'"
+            chosen = server
+        else:
+            chosen = candidates[0]  # ambiguous: first registered wins
+        proc = self._processes.get(chosen)
         if not proc:
-            return f"Error: Server '{server_name}' is not running"
+            return f"Error: Server '{chosen}' is not running"
         return await proc.call_tool(tool_name, arguments)
 
     async def close(self):
@@ -228,6 +248,29 @@ class MCPBridge:
 
 class PythonExecuteInput(BaseModel):
     code: str = Field(description="Python code to execute")
+
+
+class GetToolDetailsInput(BaseModel):
+    name: str = Field(
+        description=(
+            "Fully qualified tool name as listed in the system-prompt catalog, "
+            "formatted as `server.tool_name` (e.g. `notion.search`)."
+        ),
+    )
+
+
+class CallToolInput(BaseModel):
+    name: str = Field(
+        description=(
+            "Fully qualified tool name as listed in the system-prompt catalog, "
+            "formatted as `server.tool_name` (e.g. `notion.search`). The prefix "
+            "identifies which MCP server provides the tool."
+        ),
+    )
+    arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON object of arguments matching the tool's input_schema.",
+    )
 
 
 # ── Toolathlon Gym Environment ───────────────────────────────────────────────
@@ -243,8 +286,14 @@ class ToolathlonGym(Environment):
         self._launch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._launch_time_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
         self._mcp_bridge: MCPBridge | None = None
-        # Build set of MCP tool names for routing in _call_tool
+        # Build set of MCP tool names for routing in _call_tool. Keys are the
+        # bare (unprefixed) tool names that MCPBridge dispatches against.
         self._mcp_tool_names: set[str] = set()
+        # Per-task catalog of tool entries, populated in setup(). Each entry:
+        # {name, bare_name, server, description, input_schema}. `name` is the
+        # canonical `server.bare_name` form used by call_tool / get_tool_details.
+        self._task_tool_index: list[dict] = []
+        self._task_tool_by_name: dict[str, dict] = {}
 
     async def setup(self):
         # Load task config
@@ -254,10 +303,23 @@ class ToolathlonGym(Environment):
 
         needed_servers = self._task_config.get("needed_mcp_servers", [])
 
-        # Build MCP tool name set for _call_tool routing
+        # Build the per-task tool index used by both the system-prompt catalog
+        # and the meta-tools. Every tool is exposed with a `server.bare`
+        # prefix so the source MCP server is always explicit and dispatch is
+        # unambiguous even when bare names collide.
         for server in needed_servers:
             for tool_info in ALL_TOOL_SCHEMAS.get(server, []):
-                self._mcp_tool_names.add(tool_info["name"])
+                bare = tool_info["name"]
+                entry = {
+                    "name": f"{server}.{bare}",
+                    "bare_name": bare,
+                    "server": server,
+                    "description": tool_info.get("description", "") or "",
+                    "input_schema": tool_info.get("inputSchema") or {},
+                }
+                self._task_tool_index.append(entry)
+                self._task_tool_by_name[entry["name"]] = entry
+                self._mcp_tool_names.add(bare)
 
         # Create workspace
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +380,11 @@ class ToolathlonGym(Environment):
             )
             parts.append(sys_prompt)
 
+        # The agent only ever sees the get_tool_details / call_tool meta-tools,
+        # so we inline the per-task tool catalog up front — otherwise it has
+        # no way to know what MCP tools exist.
+        parts.append(self._tool_catalog_block())
+
         # Read task description
         task_md_path = self.task_dir / "docs" / "task.md"
         if task_md_path.exists():
@@ -328,42 +395,87 @@ class ToolathlonGym(Environment):
 
         return [TextBlock(text="\n\n".join(parts))]
 
+    @staticmethod
+    def _short_desc(text: str, max_chars: int = CATALOG_DESC_MAX_CHARS) -> str:
+        """Collapse whitespace and truncate so each catalog entry fits one line."""
+        flat = " ".join((text or "").split())
+        if len(flat) <= max_chars:
+            return flat
+        return flat[: max_chars - 1].rstrip() + "…"
+
+    def _tool_catalog_block(self) -> str:
+        by_server: dict[str, list[dict]] = defaultdict(list)
+        for entry in self._task_tool_index:
+            by_server[entry["server"]].append(entry)
+
+        lines: list[str] = [
+            "## Available MCP tools",
+            "",
+            f"This task exposes {len(self._task_tool_index)} MCP tools across "
+            f"{len(by_server)} servers, listed below as `server.tool_name — "
+            "short description`. Two meta-tools mediate access:",
+            "",
+            "- `get_tool_details(name)` — return the full `input_schema` (and "
+            "untruncated description) for one tool. Pass the exact "
+            "`server.tool_name` shown in the catalog.",
+            "- `call_tool(name, arguments)` — invoke a tool. `name` is again "
+            "the exact `server.tool_name`; `arguments` must conform to the "
+            "tool's `input_schema`.",
+            "",
+            "Typical workflow: scan the catalog → `get_tool_details` for the "
+            "tool(s) you want to call → `call_tool`. The shared "
+            "`python_execute` and `claim_done` tools remain directly callable.",
+            "",
+        ]
+        for server in sorted(by_server):
+            lines.append(f"### {server}")
+            for entry in sorted(by_server[server], key=lambda e: e["name"]):
+                desc = self._short_desc(entry["description"])
+                if desc:
+                    lines.append(f"- `{entry['name']}` — {desc}")
+                else:
+                    lines.append(f"- `{entry['name']}`")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
     def list_task_tools(self) -> ListToolsOutput:
-        needed_servers = self._task_config.get("needed_mcp_servers", [])
-        tools: list[ToolSpec] = []
-
-        # Detect name collisions across servers
-        name_counts: dict[str, int] = defaultdict(int)
-        for server in needed_servers:
-            for tool_info in ALL_TOOL_SCHEMAS.get(server, []):
-                name_counts[tool_info["name"]] += 1
-
-        has_collisions = any(c > 1 for c in name_counts.values())
-
-        for server in needed_servers:
-            for tool_info in ALL_TOOL_SCHEMAS.get(server, []):
-                name = tool_info["name"]
-                if has_collisions and name_counts[name] > 1:
-                    name = f"{server}__{name}"
-                tools.append(ToolSpec(
-                    name=name,
-                    description=tool_info.get("description", ""),
-                    input_schema=tool_info.get("inputSchema"),
-                ))
-
-        return ListToolsOutput(tools=tools)
+        return ListToolsOutput(tools=[
+            ToolSpec(
+                name="get_tool_details",
+                description=(
+                    "Return the full input_schema and description for one MCP "
+                    "tool, looked up by its `server.tool_name` identifier "
+                    "(as listed in the system-prompt catalog)."
+                ),
+                input_schema=GetToolDetailsInput.model_json_schema(),
+            ),
+            ToolSpec(
+                name="call_tool",
+                description=(
+                    "Invoke an MCP tool. Pass the `server.tool_name` from the "
+                    "system-prompt catalog and an `arguments` object matching "
+                    "that tool's input_schema (fetch via get_tool_details)."
+                ),
+                input_schema=CallToolInput.model_json_schema(),
+            ),
+        ])
 
     async def _call_tool(self, name: str, input: dict) -> RunToolOutput:
-        # Check if this is an MCP tool
-        # Handle prefixed names (server__tool) by stripping prefix
+        # Handle MCP tool names that arrive directly (some inference clients
+        # may flatten the catalog). Prefixed `server.tool` form disambiguates
+        # collisions; without a prefix we let the bridge pick.
+        explicit_server: str | None = None
         mcp_tool_name = name
-        if "__" in name:
-            parts = name.split("__", 1)
-            mcp_tool_name = parts[1]
+        if "." in name:
+            head, tail = name.split(".", 1)
+            mcp_tool_name = tail
+            explicit_server = head
 
         if mcp_tool_name in self._mcp_tool_names and self._mcp_bridge:
             try:
-                result_text = await self._mcp_bridge.call_tool(mcp_tool_name, input)
+                result_text = await self._mcp_bridge.call_tool(
+                    mcp_tool_name, input, server=explicit_server
+                )
                 # Truncate very long outputs
                 if len(result_text) > 50000:
                     result_text = result_text[:50000] + "\n... (output truncated)"
@@ -373,8 +485,53 @@ class ToolathlonGym(Environment):
             except Exception as e:
                 return RunToolOutput(RunToolError(error=f"MCP tool error: {e}"))
 
-        # Fall through to built-in tools (claim_done, python_execute)
+        # Fall through to built-in tools (claim_done, python_execute,
+        # get_tool_details, call_tool).
         return await super()._call_tool(name, input)
+
+    @tool(shared=False)
+    async def get_tool_details(self, params: GetToolDetailsInput) -> ToolOutput:
+        """Return the full schema and description for one MCP tool."""
+        entry = self._task_tool_by_name.get(params.name)
+        if entry is None:
+            return ToolOutput(blocks=[TextBlock(text=(
+                f"Error: unknown tool '{params.name}'. Pass the exact "
+                "`server.tool_name` shown in the system-prompt catalog."
+            ))])
+        payload = {
+            "name": entry["name"],
+            "server": entry["server"],
+            "description": entry["description"],
+            "input_schema": entry["input_schema"],
+        }
+        return ToolOutput(blocks=[TextBlock(text=json.dumps(payload, indent=2))])
+
+    @tool(shared=False)
+    async def call_tool(self, params: CallToolInput) -> ToolOutput:
+        """Invoke an MCP tool by name, dispatching through the running bridge."""
+        if self._mcp_bridge is None:
+            return ToolOutput(blocks=[TextBlock(
+                text="Error: MCP bridge is not running for this task."
+            )])
+
+        name = params.name
+        entry = self._task_tool_by_name.get(name)
+        if entry is None:
+            return ToolOutput(blocks=[TextBlock(text=(
+                f"Error: unknown tool '{name}'. Pass the exact "
+                "`server.tool_name` shown in the system-prompt catalog."
+            ))])
+
+        try:
+            result_text = await self._mcp_bridge.call_tool(
+                entry["bare_name"], dict(params.arguments), server=entry["server"]
+            )
+        except Exception as e:
+            return ToolOutput(blocks=[TextBlock(text=f"MCP tool error: {e}")])
+
+        if len(result_text) > 50000:
+            result_text = result_text[:50000] + "\n... (output truncated)"
+        return ToolOutput(blocks=[TextBlock(text=result_text)])
 
     @tool
     async def claim_done(self) -> ToolOutput:
