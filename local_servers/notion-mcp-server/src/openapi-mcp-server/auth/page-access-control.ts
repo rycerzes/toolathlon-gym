@@ -1,4 +1,4 @@
-import { HttpClient } from '../client/http-client.js'
+import { PgHttpClient as HttpClient } from '../client/pg-client.js'
 
 export interface PageAccessControlOptions {
   pageIds?: string[]
