@@ -93,19 +93,19 @@ done && wait
 # yahoo-finance Toolathlon fork uses psycopg2 for PG-backed data
 RUN cd /opt/local_servers/yahoo-finance-mcp && uv add psycopg2-binary
 
-# Setup PostgreSQL: create user/database and allow trust auth for local connections
+# Create the eigent superuser (peer auth as the postgres OS user).
 USER postgres
 RUN service postgresql start && \
     psql -c "CREATE USER eigent WITH PASSWORD 'camel' SUPERUSER;" && \
-    psql -c "CREATE DATABASE toolathlon_gym OWNER eigent;" && \
-    psql -c "CREATE DATABASE toolathlon OWNER eigent;" && \
     service postgresql stop
-# Allow all local connections without password (trust auth)
+USER root
+
+# Allow all local connections without password (trust auth) so subsequent
+# build steps and the runtime env server can connect as eigent.
 RUN PG_HBA=$(find /etc/postgresql -name pg_hba.conf) && \
     sed -i 's/peer$/trust/' "$PG_HBA" && \
     sed -i 's/scram-sha-256$/trust/' "$PG_HBA" && \
     sed -i 's/md5$/trust/' "$PG_HBA"
-USER root
 
 # Copy project files
 WORKDIR /app
@@ -116,6 +116,21 @@ COPY server.py /app/server.py
 COPY discover_tools.py /app/discover_tools.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Bake the seed and the MCP tool catalog into the image:
+#   1. Restore init.sql.gz into `toolathlon_template`.
+#   2. Run discover_tools.py against the template so tool_schemas.json ships
+#      in the image (no runtime discovery, no runtime DB restore).
+#   3. Mark the seed as a Postgres template so per-session DBs can clone it
+#      with `CREATE DATABASE ... TEMPLATE toolathlon_template`.
+RUN service postgresql start && \
+    until pg_isready -U eigent 2>/dev/null; do sleep 0.5; done && \
+    psql -U eigent -d postgres -c "CREATE DATABASE toolathlon_template OWNER eigent;" && \
+    gunzip -c /app/db/init.sql.gz | psql -U eigent -d toolathlon_template -v ON_ERROR_STOP=1 && \
+    PGHOST=localhost PGDATABASE=toolathlon_template PG_DATABASE=toolathlon_template \
+        python3 /app/discover_tools.py && \
+    psql -U eigent -d postgres -c "UPDATE pg_database SET datistemplate = true WHERE datname = 'toolathlon_template';" && \
+    service postgresql stop
 
 EXPOSE 8080
 CMD ["/app/entrypoint.sh"]

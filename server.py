@@ -162,9 +162,13 @@ class _MCPProcess:
 class MCPBridge:
     """Manages MCP server subprocesses for a single session."""
 
-    def __init__(self, needed_servers: list[str], workspace_dir: str):
+    def __init__(self, needed_servers: list[str], workspace_dir: str, pg_env: dict[str, str]):
         self.needed_servers = needed_servers
         self.workspace_dir = workspace_dir
+        # Env overrides (PGHOST, PGDATABASE, …) applied AFTER any YAML-set env
+        # so e.g. `PG_DATABASE: "toolathlon"` in 12306.yaml gets overridden by
+        # the per-session DB name.
+        self.pg_env = pg_env
         self._processes: dict[str, _MCPProcess] = {}
         # bare tool name → list of servers offering it. Multi-valued because
         # different MCP servers can advertise tools with the same name; callers
@@ -199,8 +203,10 @@ class MCPBridge:
                     if os.path.isfile(script_path):
                         cwd = os.path.dirname(script_path)
 
-            # Override PG_HOST to localhost since DB runs in same container
-            full_env = {**os.environ, **env_vars, "PG_HOST": "localhost", "PGHOST": "localhost"}
+            # Apply pg_env AFTER YAML env so 12306/youtube/youtube_transcript
+            # (which hardcode `PG_DATABASE: "toolathlon"`) get rewired to the
+            # per-session DB.
+            full_env = {**os.environ, **env_vars, **self.pg_env}
             os.makedirs(cwd, exist_ok=True)
 
             try:
@@ -282,6 +288,9 @@ class ToolathlonGym(Environment):
         self.task_name: str = task_spec.get("task_name", "")
         self.task_dir = TASKS_ROOT / self.task_name
         self.workspace_dir = Path(f"/tmp/workspaces/{uuid4()}")
+        # Per-session Postgres DB cloned from `toolathlon_template` so tasks
+        # can never see each other's mutations, even when sessions share a pod.
+        self._db_name = f"s_{uuid4().hex[:16]}"
         self._task_config: dict = {}
         self._launch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._launch_time_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
@@ -295,7 +304,47 @@ class ToolathlonGym(Environment):
         self._task_tool_index: list[dict] = []
         self._task_tool_by_name: dict[str, dict] = {}
 
+    def _pg_env(self) -> dict[str, str]:
+        """Env additions that point any subprocess at this session's DB."""
+        return {
+            "PGHOST": "localhost",
+            "PG_HOST": "localhost",
+            "PGDATABASE": self._db_name,
+            "PG_DATABASE": self._db_name,
+        }
+
+    async def _psql(self, sql: str, *, dbname: str = "postgres") -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "psql", "-U", "eigent", "-d", dbname, "-v", "ON_ERROR_STOP=1", "-c", sql,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PGHOST": "localhost"},
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"psql failed ({proc.returncode}): {stderr.decode()[:500]}")
+
     async def setup(self):
+        # Clone the seeded template into a fresh per-session DB. Done first so
+        # preprocess and the MCP servers all talk to a clean copy of the world.
+        await self._psql(
+            f'CREATE DATABASE "{self._db_name}" TEMPLATE toolathlon_template;'
+        )
+        try:
+            await self._setup_after_db()
+        except BaseException:
+            # The framework only calls teardown() once the env is registered
+            # in active_envs, which happens AFTER setup() returns. If we fail
+            # mid-setup, drop the DB ourselves so we don't leak.
+            try:
+                await self._psql(
+                    f'DROP DATABASE IF EXISTS "{self._db_name}" WITH (FORCE);'
+                )
+            except Exception:
+                pass
+            raise
+
+    async def _setup_after_db(self):
         # Load task config
         config_path = self.task_dir / "task_config.json"
         if config_path.exists():
@@ -351,7 +400,7 @@ class ToolathlonGym(Environment):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 cwd=str(self.task_dir / "preprocess"),
-                env={**os.environ, "PGHOST": "localhost"},
+                env={**os.environ, **self._pg_env()},
             )
             try:
                 await asyncio.wait_for(proc.wait(), timeout=30)
@@ -362,7 +411,7 @@ class ToolathlonGym(Environment):
 
         # Start MCP servers
         if needed_servers:
-            self._mcp_bridge = MCPBridge(needed_servers, str(self.workspace_dir))
+            self._mcp_bridge = MCPBridge(needed_servers, str(self.workspace_dir), self._pg_env())
             await self._mcp_bridge.start()
 
     def get_prompt(self) -> Sequence[TextBlock]:
@@ -577,7 +626,7 @@ class ToolathlonGym(Environment):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.task_dir / "evaluation"),
-                env={**os.environ, "PGHOST": "localhost"},
+                env={**os.environ, **self._pg_env()},
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
             output = stdout.decode() + stderr.decode()
@@ -619,7 +668,7 @@ class ToolathlonGym(Environment):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.workspace_dir),
-                env={**os.environ, "PGHOST": "localhost"},
+                env={**os.environ, **self._pg_env()},
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
             output = stdout.decode()
@@ -643,6 +692,14 @@ class ToolathlonGym(Environment):
         if self._mcp_bridge:
             await self._mcp_bridge.close()
         shutil.rmtree(self.workspace_dir, ignore_errors=True)
+        # Drop the per-session DB. Best-effort: a leak just means the next
+        # entrypoint.sh sweep will collect it.
+        try:
+            await self._psql(
+                f'DROP DATABASE IF EXISTS "{self._db_name}" WITH (FORCE);'
+            )
+        except Exception as e:
+            print(f"[teardown] DROP DATABASE {self._db_name} failed: {e}", flush=True)
 
     @classmethod
     def list_splits(cls) -> list[str]:

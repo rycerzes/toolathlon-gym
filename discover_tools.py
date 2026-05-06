@@ -92,8 +92,15 @@ def discover_server(yaml_path: Path, workspace: str) -> list[dict] | None:
             if os.path.isfile(script_path):
                 cwd = os.path.dirname(script_path)
 
-    # Override PG_HOST to localhost since DB runs in same container
-    full_env = {**os.environ, **env_vars, "PG_HOST": "localhost", "PGHOST": "localhost"}
+    # Override PG_HOST/PG_DATABASE *after* YAML env so configs that hardcode
+    # `PG_DATABASE: "toolathlon"` get rewired to whatever DB the caller chose
+    # (toolathlon_template at build time).
+    pg_db = os.environ.get("PG_DATABASE") or os.environ.get("PGDATABASE") or "toolathlon_template"
+    full_env = {
+        **os.environ, **env_vars,
+        "PG_HOST": "localhost", "PGHOST": "localhost",
+        "PG_DATABASE": pg_db, "PGDATABASE": pg_db,
+    }
     os.makedirs(cwd, exist_ok=True)
 
     name = cfg.get("name", yaml_path.stem)
