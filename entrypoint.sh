@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# MCP servers must write to the same DB the eval/preprocess scripts read from,
+# else writes via gsheet/gcal/emails/gforms are invisible to the evaluator.
+export PG_DATABASE=toolathlon_gym
+export PG_USER=eigent
+export PG_PASSWORD=camel
+
 # Start PostgreSQL
 service postgresql start
 until pg_isready -U eigent -d toolathlon_gym 2>/dev/null; do sleep 1; done

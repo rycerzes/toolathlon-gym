@@ -2,7 +2,8 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, JSONRPCResponse, ListToolsRequestSchema, Tool } from '@modelcontextprotocol/sdk/types.js'
 import { JSONSchema7 as IJsonSchema } from 'json-schema'
 import { OpenAPIToMCPConverter } from '../openapi/parser.js'
-import { HttpClient, HttpClientError } from '../client/http-client.js'
+import { HttpClientError } from '../client/http-client.js'
+import { PgHttpClient } from '../client/pg-client.js'
 import { OpenAPIV3 } from 'openapi-types'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { PageAccessController } from '../auth/page-access-control.js'
@@ -32,7 +33,7 @@ export interface MCPProxyOptions {
 // import this class, extend and return server
 export class MCPProxy {
   private server: Server
-  private httpClient: HttpClient
+  private httpClient: PgHttpClient
   private tools: Record<string, NewToolDefinition>
   private openApiLookup: Record<string, OpenAPIV3.OperationObject & { method: string; path: string }>
   private pageAccessController: PageAccessController | null = null
@@ -43,7 +44,7 @@ export class MCPProxy {
     if (!baseUrl) {
       throw new Error('No base URL found in OpenAPI spec')
     }
-    this.httpClient = new HttpClient(
+    this.httpClient = new PgHttpClient(
       {
         baseUrl,
         headers: this.parseHeadersFromEnv(),

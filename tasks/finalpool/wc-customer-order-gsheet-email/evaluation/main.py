@@ -271,13 +271,12 @@ def main():
     check_gsheet_summary()
     check_emails()
 
+    overall = FAIL_COUNT == 0
     print(f"\n=== SUMMARY ===")
     print(f"  Passed: {PASS_COUNT}")
     print(f"  Failed: {FAIL_COUNT}")
-    if FAIL_COUNT > 0:
-        print(f"  WARNING: {FAIL_COUNT} DB checks failed (not blocking)")
-    print(f"  Overall: PASS")
-    sys.exit(0)
+    print(f"  Overall: {'PASS' if overall else 'FAIL'}")
+    sys.exit(0 if overall else 1)
 
 
 if __name__ == "__main__":
