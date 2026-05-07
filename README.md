@@ -19,6 +19,16 @@ Toolathlon Gym is an ORS environment for evaluating multi-tool coordination capa
 
 Each task runs inside a Docker container with PostgreSQL, 25 MCP server implementations, Node.js 22, and Python 3.12. The ORS server runs alongside all services in a single container.
 
+## Docker image publishing (GHCR)
+
+This repository includes a GitHub Actions workflow at `.github/workflows/docker-publish.yml` using the Marketplace action `docker/build-push-action` ("Build and push Docker images") that:
+
+- builds the root `Dockerfile`
+- publishes images to `ghcr.io/<owner>/<repo>` on pushes to `main`/`master` and version tags (`v*`)
+- also runs on pull requests (build only, no push)
+
+Published tags include branch/tag names, commit SHA, and `latest` on the default branch.
+
 ## License
 
 [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
